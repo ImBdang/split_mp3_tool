@@ -28,6 +28,8 @@ class MP3Splitter:
         self.play_start_time = 0
         self.play_offset_ms = 0
         self.updater_running = False
+        self.seeking = False      # True khi user đang kéo seek bar
+        self.loading = False      # True khi đang load file trong background
 
         self._build_ui()
         self._load_file_list()
@@ -62,11 +64,16 @@ class MP3Splitter:
         frame_seek.pack(fill=tk.X, padx=10, pady=5)
 
         self.seek_var = tk.DoubleVar(value=0)
-        self.seek_bar = ttk.Scale(frame_seek, from_=0, to=100, variable=self.seek_var, command=self._on_seek)
+        self.seek_bar = ttk.Scale(frame_seek, from_=0, to=100, variable=self.seek_var, command=self._on_seek_drag)
         self.seek_bar.pack(fill=tk.X)
+        # Chỉ seek thật sự khi nhả chuột — tránh lag khi kéo
+        self.seek_bar.bind("<ButtonRelease-1>", self._on_seek_release)
 
         self.time_label = tk.Label(frame_seek, text="00:00 / 00:00")
         self.time_label.pack()
+
+        self.loading_label = tk.Label(frame_seek, text="", fg="orange", font=("monospace", 10))
+        self.loading_label.pack()
 
         # Markers
         frame_marks = tk.Frame(self.root)
@@ -109,21 +116,42 @@ class MP3Splitter:
         self._load_file(filepath)
 
     def _load_file(self, filepath):
+        if self.loading:
+            return  # tránh double-click trong lúc đang load
         self._stop()
+        self.audio = None
         self.current_file = filepath
-        self.audio = AudioSegment.from_mp3(str(filepath))
-        self.audio_length_ms = len(self.audio)
         self.start_pos_ms = None
         self.end_pos_ms = None
         self.start_label.config(text="Start [J]: --:--")
         self.end_label.config(text="End [K]: --:--")
+        self.seek_var.set(0)
+        self._update_time_label(0)
+
+        # Disable UI khi đang load
+        self.loading = True
+        self.loading_label.config(text=f"⏳ Loading {filepath.name}...")
+        self.file_listbox.config(state=tk.DISABLED)
+        self.btn_play.config(state=tk.DISABLED)
+
+        # Load pydub trong background thread để không block UI
+        def _do_load():
+            audio = AudioSegment.from_mp3(str(filepath))
+            # Xong thì trả về main thread qua root.after
+            self.root.after(0, lambda: self._on_file_loaded(filepath, audio))
+
+        threading.Thread(target=_do_load, daemon=True).start()
+
+    def _on_file_loaded(self, filepath, audio):
+        """Callback chạy trên main thread sau khi load xong."""
+        self.audio = audio
+        self.audio_length_ms = len(audio)
 
         # Count existing splits
         stem = filepath.stem
         out_dir = SPLITTED_DATA / stem
         if out_dir.exists():
-            existing = list(out_dir.glob("*.mp3"))
-            self.split_count = len(existing)
+            self.split_count = len(list(out_dir.glob("*.mp3")))
         else:
             self.split_count = 0
 
@@ -133,6 +161,12 @@ class MP3Splitter:
         self._log(f"Loaded: {filepath.name} ({self._fmt(self.audio_length_ms)})")
 
         pygame.mixer.music.load(str(filepath))
+
+        # Re-enable UI
+        self.loading = False
+        self.loading_label.config(text="")
+        self.file_listbox.config(state=tk.NORMAL)
+        self.btn_play.config(state=tk.NORMAL)
 
     def _toggle_play(self, event):
         if self.audio is None:
@@ -161,10 +195,20 @@ class MP3Splitter:
         if self.audio:
             self._update_time_label(0)
 
-    def _on_seek(self, val):
+    def _on_seek_drag(self, val):
+        """Gọi liên tục khi kéo — chỉ cập nhật label, KHÔNG động vào pygame."""
         if self.audio is None:
             return
+        self.seeking = True
         ms = float(val)
+        self._update_time_label(ms)
+
+    def _on_seek_release(self, event):
+        """Gọi một lần khi nhả chuột — lúc này mới thật sự seek."""
+        if self.audio is None:
+            return
+        self.seeking = False
+        ms = self.seek_var.get()
         self.play_offset_ms = ms
         self._update_time_label(ms)
         if self.playing:
@@ -183,13 +227,15 @@ class MP3Splitter:
         if not self.playing:
             self.updater_running = False
             return
-        pos = self._current_pos_ms()
-        if pos >= self.audio_length_ms:
-            self.playing = False
-            self.play_offset_ms = 0
-            pos = 0
-        self.seek_var.set(pos)
-        self._update_time_label(pos)
+        # Không cập nhật seek bar khi user đang kéo
+        if not self.seeking:
+            pos = self._current_pos_ms()
+            if pos >= self.audio_length_ms:
+                self.playing = False
+                self.play_offset_ms = 0
+                pos = 0
+            self.seek_var.set(pos)
+            self._update_time_label(pos)
         self.root.after(100, self._update_position)
 
     def _update_time_label(self, ms):
